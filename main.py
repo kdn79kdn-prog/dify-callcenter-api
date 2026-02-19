@@ -11,7 +11,7 @@ app = FastAPI()
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2026-02-19-01"}
 
 
 def _get_drive_service():
