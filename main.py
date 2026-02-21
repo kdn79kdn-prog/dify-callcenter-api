@@ -383,7 +383,7 @@ def run_daily_close():
 
         # 要約生成（落ちても送信は止めない）
         try:
-            summary = generate_summary(fact_daily)
+            summary = generate_summary(fact_daily, as_of_date)
         except Exception as e:
             summary = f"要約生成に失敗しました: {type(e).__name__}: {e}"
 
