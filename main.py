@@ -386,17 +386,19 @@ def run_daily_close():
         # メール送信（添付）
         attach_name = f"{as_of_date}_前日確定版_実績.xlsx"
         subject = f"[前日確定版] {as_of_date} 実績レポート"
-        try:
-    summary = generate_summary(fact_daily)
-except Exception as e:
-    summary = f"要約生成に失敗しました: {type(e).__name__}: {e}"
 
-body = (
-    f"{as_of_date} の前日確定版レポートを生成しました。\n"
-    f"添付ファイルをご確認ください。\n\n"
-    f"▼ 5行要約\n"
-    f"{summary}\n"
-)
+        # 5行要約（まずは接続テストでもOK。失敗しても送信は続ける）
+        try:
+            summary = generate_summary(fact_daily)
+        except Exception as e:
+            summary = f"要約生成に失敗しました: {type(e).__name__}: {e}"
+
+        body = (
+            f"{as_of_date} の前日確定版レポートを生成しました。\n"
+            f"添付ファイルをご確認ください。\n\n"
+            f"▼ 5行要約\n"
+            f"{summary}\n"
+        )
 
         _send_mail_with_attachment(
             subject=subject,
@@ -404,19 +406,3 @@ body = (
             attachment_bytes=output_excel_bytes,
             attachment_filename=attach_name,
         )
-
-        return {
-            "status": "ok",
-            "phase": "phase3_mail_sent",
-            "as_of_date": as_of_date,
-            "input_daily_folder_id": daily_folder_id,
-            "fact_daily_rows": int(len(fact_daily)),
-            "fact_long_rows": int(len(fact_long)),
-            "attachment_filename": attach_name,
-            "found_files": found_file_names,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Run failed: {type(e).__name__}: {e}")
