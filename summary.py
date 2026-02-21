@@ -1,2 +1,2 @@
-def generate_summary(fact_daily_df):
-    return "要約テスト（仮）"
+def generate_summary(fact_daily):
+    return "要約テスト（接続確認OK）"
