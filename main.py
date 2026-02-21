@@ -8,10 +8,14 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload
 from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
+
+import smtplib
+from email.message import EmailMessage
+
 
 app = FastAPI()
 
@@ -51,7 +55,7 @@ SHEET_FACT_LONG = "Fact_Long"
 # ----------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2026-02-21-Phase3-MonthOverwrite-01"}
+    return {"status": "ok", "version": "2026-02-21-MailAttach-01"}
 
 
 # ----------------------------
@@ -65,7 +69,7 @@ def _get_drive_service():
     sa_info = json.loads(sa_json)
     credentials = service_account.Credentials.from_service_account_info(
         sa_info,
-        scopes=["https://www.googleapis.com/auth/drive"],
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],  # 読み取りで十分
     )
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
@@ -77,41 +81,6 @@ def _find_child_folder_by_name(drive, parent_folder_id: str, folder_name: str) -
         f"name = '{folder_name}' and trashed = false"
     )
     res = drive.files().list(q=q, fields="files(id,name)", pageSize=10).execute()
-    files = res.get("files", [])
-    return files[0] if files else None
-
-
-def _ensure_child_folder(drive, parent_folder_id: str, folder_name: str) -> Dict[str, str]:
-    existing = _find_child_folder_by_name(drive, parent_folder_id, folder_name)
-    if existing:
-        return existing
-
-    metadata = {
-        "name": folder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_folder_id],
-    }
-    created = drive.files().create(body=metadata, fields="id,name").execute()
-    return {"id": created["id"], "name": created["name"]}
-
-
-def _find_child_file_by_name_latest(drive, parent_folder_id: str, filename: str) -> Optional[Dict[str, str]]:
-    """
-    フォルダ直下の同名ファイルを探し、modifiedTimeが新しいものを返す。
-    """
-    # nameにシングルクォートがあると壊れるので簡易エスケープ
-    safe_name = filename.replace("'", "\\'")
-    q = (
-        f"'{parent_folder_id}' in parents and "
-        f"mimeType != 'application/vnd.google-apps.folder' and "
-        f"name = '{safe_name}' and trashed = false"
-    )
-    res = drive.files().list(
-        q=q,
-        fields="files(id,name,modifiedTime)",
-        pageSize=10,
-        orderBy="modifiedTime desc",
-    ).execute()
     files = res.get("files", [])
     return files[0] if files else None
 
@@ -135,37 +104,6 @@ def _download_file_bytes(drive, file_id: str) -> bytes:
     while not done:
         _, done = downloader.next_chunk()
     return fh.getvalue()
-
-
-def _upsert_bytes_to_drive(
-    drive,
-    parent_folder_id: str,
-    filename: str,
-    content: bytes,
-    mimetype: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-) -> Dict[str, Any]:
-    """
-    同名ファイルがあれば update（上書き）、なければ create。
-    """
-    existing = _find_child_file_by_name_latest(drive, parent_folder_id, filename)
-
-    media = MediaIoBaseUpload(BytesIO(content), mimetype=mimetype, resumable=False)
-
-    if existing:
-        updated = drive.files().update(
-            fileId=existing["id"],
-            media_body=media,
-            body={"name": filename},
-            fields="id,name,modifiedTime",
-        ).execute()
-        return {"mode": "updated", "id": updated["id"], "name": updated["name"], "modifiedTime": updated.get("modifiedTime")}
-    else:
-        created = drive.files().create(
-            body={"name": filename, "parents": [parent_folder_id]},
-            media_body=media,
-            fields="id,name,modifiedTime",
-        ).execute()
-        return {"mode": "created", "id": created["id"], "name": created["name"], "modifiedTime": created.get("modifiedTime")}
 
 
 # ----------------------------
@@ -272,7 +210,7 @@ def _build_fact_daily_and_long(
 
 
 # ----------------------------
-# openpyxl（Phase3）
+# openpyxl（テンプレに書き込み）
 # ----------------------------
 def _clear_worksheet(ws):
     mr = ws.max_row
@@ -318,25 +256,72 @@ def _build_output_excel_bytes(template_bytes: bytes, fact_daily: pd.DataFrame, f
 
 
 # ----------------------------
-# Main Endpoint（Phase3: 月フォルダ + 上書き）
+# Mail（添付送信）
+# ----------------------------
+def _send_mail_with_attachment(
+    subject: str,
+    body: str,
+    attachment_bytes: bytes,
+    attachment_filename: str,
+):
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_pass = os.environ.get("SMTP_PASS")
+
+    mail_to = os.environ.get("MAIL_TO")
+    mail_from = os.environ.get("MAIL_FROM") or smtp_user
+
+    missing = [k for k, v in {
+        "SMTP_HOST": smtp_host,
+        "SMTP_USER": smtp_user,
+        "SMTP_PASS": smtp_pass,
+        "MAIL_TO": mail_to,
+    }.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing env for mail: {missing}")
+
+    to_list = [x.strip() for x in mail_to.split(",") if x.strip()]
+    if not to_list:
+        raise RuntimeError("MAIL_TO is empty")
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = mail_from
+    msg["To"] = ", ".join(to_list)
+    msg.set_content(body)
+
+    msg.add_attachment(
+        attachment_bytes,
+        maintype="application",
+        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=attachment_filename,
+    )
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as s:
+        s.ehlo()
+        s.starttls()
+        s.ehlo()
+        s.login(smtp_user, smtp_pass)
+        s.send_message(msg)
+
+
+# ----------------------------
+# Main Endpoint
 # ----------------------------
 @app.post("/run_daily_close")
 def run_daily_close():
     input_folder_id = os.environ.get("DRIVE_INPUT_FOLDER_ID")
-    output_root_folder_id = os.environ.get("DRIVE_OUTPUT_FOLDER_ID")
     template_file_id = os.environ.get("DRIVE_TEMPLATE_FILE_ID")
 
     if not input_folder_id:
         raise HTTPException(status_code=500, detail="Missing env: DRIVE_INPUT_FOLDER_ID")
-    if not output_root_folder_id:
-        raise HTTPException(status_code=500, detail="Missing env: DRIVE_OUTPUT_FOLDER_ID")
     if not template_file_id:
         raise HTTPException(status_code=500, detail="Missing env: DRIVE_TEMPLATE_FILE_ID")
 
     jst = ZoneInfo("Asia/Tokyo")
     as_of_date_dt = datetime.now(jst).date() - timedelta(days=1)
     as_of_date = as_of_date_dt.strftime("%Y-%m-%d")
-    month_key = as_of_date_dt.strftime("%Y-%m")  # ★月フォルダ
 
     try:
         drive = _get_drive_service()
@@ -391,36 +376,34 @@ def run_daily_close():
 
         fact_daily, fact_long = _build_fact_daily_and_long(raw_by_metric, as_of_date)
 
-        # Phase3: テンプレ取得 -> 書き込み
+        # Phase3: テンプレ取得 -> 書き込み（bytes化）
         template_bytes = _download_file_bytes(drive, template_file_id)
         output_excel_bytes = _build_output_excel_bytes(template_bytes, fact_daily, fact_long)
 
-        # OUTPUT/YYYY-MM フォルダを作成/取得（★月フォルダ）
-        out_month_folder = _ensure_child_folder(drive, output_root_folder_id, month_key)
+        # メール送信（添付）
+        attach_name = f"{as_of_date}_前日確定版_実績.xlsx"
+        subject = f"[前日確定版] {as_of_date} 実績レポート"
+        body = (
+            f"{as_of_date} の前日確定版レポートを生成しました。\n"
+            f"添付ファイルをご確認ください。\n"
+        )
 
-        # ファイル名（同名で上書きされる）
-        out_filename = f"{month_key}_前日確定版_実績.xlsx"
-
-        upserted = _upsert_bytes_to_drive(
-            drive,
-            parent_folder_id=out_month_folder["id"],
-            filename=out_filename,
-            content=output_excel_bytes,
+        _send_mail_with_attachment(
+            subject=subject,
+            body=body,
+            attachment_bytes=output_excel_bytes,
+            attachment_filename=attach_name,
         )
 
         return {
             "status": "ok",
-            "phase": "phase3_month_folder_overwrite",
+            "phase": "phase3_mail_sent",
             "as_of_date": as_of_date,
-            "month_key": month_key,
             "input_daily_folder_id": daily_folder_id,
-            "output_month_folder": out_month_folder,
-            "output_file": upserted,
             "fact_daily_rows": int(len(fact_daily)),
             "fact_long_rows": int(len(fact_long)),
-            "fact_daily_preview": fact_daily.head(3).to_dict(orient="records"),
-            "fact_long_preview": fact_long.head(5).to_dict(orient="records"),
-            "extra_files": sorted(list(found_set - set(REQUIRED_FILES))),
+            "attachment_filename": attach_name,
+            "found_files": found_file_names,
         }
 
     except HTTPException:
