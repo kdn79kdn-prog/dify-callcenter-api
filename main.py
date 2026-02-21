@@ -1,11 +1,13 @@
 import os
 import json
+import uuid
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Any, Dict, List, Tuple, Optional
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -23,6 +25,15 @@ from summary import generate_summary
 # FastAPI App
 # ----------------------------
 app = FastAPI()
+
+# ----------------------------
+# 簡易ロック＆簡易台帳（練習用：プロセス内メモリ）
+# ※本番はDrive/DBなど永続化へ
+# ----------------------------
+RUN_LOCK: Dict[str, datetime] = {}           # as_of_date -> lock acquired time
+RUN_SUCCESS: Dict[str, Dict[str, Any]] = {}  # as_of_date -> success record
+
+LOCK_TTL_SECONDS = 60 * 30  # 30分（保険）
 
 # ----------------------------
 # 設定
@@ -314,7 +325,9 @@ def _send_mail_with_attachment(
 # Main Endpoint
 # ----------------------------
 @app.post("/run_daily_close")
-def run_daily_close():
+def run_daily_close(
+    target_date: Optional[str] = Query(default=None, description="YYYY-MM-DD. default = yesterday(JST)")
+):
     input_folder_id = os.environ.get("DRIVE_INPUT_FOLDER_ID")
     template_file_id = os.environ.get("DRIVE_TEMPLATE_FILE_ID")
 
@@ -324,8 +337,43 @@ def run_daily_close():
         raise HTTPException(status_code=500, detail="Missing env: DRIVE_TEMPLATE_FILE_ID")
 
     jst = ZoneInfo("Asia/Tokyo")
-    as_of_date_dt = datetime.now(jst).date() - timedelta(days=1)
-    as_of_date = as_of_date_dt.strftime("%Y-%m-%d")
+    if target_date:
+        as_of_date = target_date.strip()
+    else:
+        as_of_date_dt = datetime.now(jst).date() - timedelta(days=1)
+        as_of_date = as_of_date_dt.strftime("%Y-%m-%d")
+
+    # 既に成功済み（練習用：メモリ台帳）
+    if as_of_date in RUN_SUCCESS:
+        prev = RUN_SUCCESS[as_of_date]
+        return {
+            "result": "already_sent",
+            "as_of_date": as_of_date,
+            "run_id": prev.get("run_id"),
+            "finished_at": prev.get("finished_at"),
+            "message": "Already sent for this date (memory ledger).",
+        }
+
+    # ロックTTL掃除
+    now = datetime.now(jst)
+    expired_keys = []
+    for k, t in RUN_LOCK.items():
+        if (now - t).total_seconds() > LOCK_TTL_SECONDS:
+            expired_keys.append(k)
+    for k in expired_keys:
+        RUN_LOCK.pop(k, None)
+
+    # 実行中ロック
+    if as_of_date in RUN_LOCK:
+        return {
+            "result": "running",
+            "as_of_date": as_of_date,
+            "message": "Job is already running (memory lock).",
+        }
+
+    # ロック取得
+    RUN_LOCK[as_of_date] = now
+    run_id = str(uuid.uuid4())
 
     try:
         drive = _get_drive_service()
@@ -333,10 +381,13 @@ def run_daily_close():
         # Phase1: 前日フォルダ取得
         daily_folder = _find_child_folder_by_name(drive, input_folder_id, as_of_date)
         if not daily_folder:
-            raise HTTPException(
-                status_code=409,
-                detail=f"INPUT_NOT_READY: daily folder not found: {as_of_date}",
-            )
+            return {
+                "result": "input_not_ready",
+                "phase": "phase1_find_folder",
+                "as_of_date": as_of_date,
+                "run_id": run_id,
+                "detail": f"Daily folder not found: {as_of_date}",
+            }
 
         daily_folder_id = daily_folder["id"]
         children = _list_child_files(drive, daily_folder_id, page_size=200)
@@ -354,10 +405,12 @@ def run_daily_close():
 
         if missing_files:
             return {
-                "status": "error",
+                "result": "input_not_ready",
                 "phase": "phase1_validate_inputs",
                 "as_of_date": as_of_date,
+                "run_id": run_id,
                 "missing_files": missing_files,
+                "found_files": found_file_names,
             }
 
         # Phase2: Data読み込み
@@ -405,16 +458,36 @@ def run_daily_close():
             attachment_filename=attach_name,
         )
 
-        return {
-            "status": "ok",
-            "phase": "phase3_mail_sent",
-            "as_of_date": as_of_date,
+        # 成功を簡易台帳に保存（練習用）
+        RUN_SUCCESS[as_of_date] = {
+            "run_id": run_id,
+            "finished_at": datetime.now(jst).isoformat(),
             "fact_daily_rows": int(len(fact_daily)),
             "fact_long_rows": int(len(fact_long)),
             "attachment_filename": attach_name,
         }
 
-    except HTTPException:
-        raise
+        return {
+            "result": "success",
+            "phase": "phase3_mail_sent",
+            "as_of_date": as_of_date,
+            "run_id": run_id,
+            "fact_daily_rows": int(len(fact_daily)),
+            "fact_long_rows": int(len(fact_long)),
+            "attachment_filename": attach_name,
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Run failed: {type(e).__name__}: {e}")
+        return JSONResponse(
+            status_code=200,
+            content={
+                "result": "failed",
+                "as_of_date": as_of_date,
+                "run_id": run_id,
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+            },
+        )
+
+    finally:
+        RUN_LOCK.pop(as_of_date, None)
