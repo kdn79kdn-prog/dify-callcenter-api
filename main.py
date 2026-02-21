@@ -386,10 +386,17 @@ def run_daily_close():
         # メール送信（添付）
         attach_name = f"{as_of_date}_前日確定版_実績.xlsx"
         subject = f"[前日確定版] {as_of_date} 実績レポート"
-        body = (
-            f"{as_of_date} の前日確定版レポートを生成しました。\n"
-            f"添付ファイルをご確認ください。\n"
-        )
+        try:
+    summary = generate_summary(fact_daily)
+except Exception as e:
+    summary = f"要約生成に失敗しました: {type(e).__name__}: {e}"
+
+body = (
+    f"{as_of_date} の前日確定版レポートを生成しました。\n"
+    f"添付ファイルをご確認ください。\n\n"
+    f"▼ 5行要約\n"
+    f"{summary}\n"
+)
 
         _send_mail_with_attachment(
             subject=subject,
