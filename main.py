@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 
+from summary import generate_summary
+
 import smtplib
 from email.message import EmailMessage
 
